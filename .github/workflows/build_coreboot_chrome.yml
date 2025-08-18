@@ -12,6 +12,10 @@ on:
         description: 'Chromebook board name (e.g. samus, glk, panther, etc)'
         required: true
         type: string
+      CUSTOM_LOGO_BMP:
+        description: 'Path to custom coreboot_logo.bmp in repo (leave blank to use default)'
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -35,6 +39,91 @@ jobs:
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install \
+          git build-essential gnat flex bison libncurses5-dev libncursesw5-dev \
+          zlib1g-dev libusb-1.0-0-dev libpci-dev libftdi-dev libssl-dev \
+          libelf-dev python3 python3-distutils python3-pip \
+          cmake doxygen help2man
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+
+    # Step 3: Clone MrChromebox's coreboot repository (full clone for reliability)
+    - name: Clone coreboot source code
+      run: |
+        set -e
+        git clone --recursive $REPO_URL -b $REPO_BRANCH coreboot
+
+    # Step 4: Build only the i386 toolchain (performance optimization)
+    - name: Build i386 toolchain for coreboot
+      run: |
+        set -e
+        cd coreboot
+        make crossgcc-i386 || { echo "Toolchain build failed"; exit 1; }
+
+    # Step 5: Replace the default logo if a custom logo is provided
+    - name: Replace default coreboot logo with custom logo (if provided)
+      run: |
+        set -e
+        # Only replace if user has provided a custom logo path
+        if [ -n "${{ github.event.inputs.CUSTOM_LOGO_BMP }}" ]; then
+          CUSTOM_LOGO="${{ github.event.inputs.CUSTOM_LOGO_BMP }}"
+          TARGET_LOGO="coreboot/Documentation/coreboot_logo.bmp"
+          # Error handling: Check if custom logo file exists
+          if [ ! -f "$CUSTOM_LOGO" ]; then
+            echo "Error: Custom logo file '$CUSTOM_LOGO' not found in workspace."
+            exit 1
+          fi
+          # Backup existing logo for edge case recovery
+          if [ -f "$TARGET_LOGO" ]; then
+            cp "$TARGET_LOGO" "${TARGET_LOGO}.bak"
+          fi
+          # Replace logo
+          cp "$CUSTOM_LOGO" "$TARGET_LOGO"
+          echo "Custom logo '$CUSTOM_LOGO' has replaced '$TARGET_LOGO'."
+        else
+          echo "No custom logo provided, using default coreboot_logo.bmp."
+        fi
+
+    # Step 6: Execute build-uefi.sh for specified board
+    - name: Build UEFI ROM for board ${{ github.event.inputs.BOARD_NAME }}
+      working-directory: coreboot
+      env:
+        BOARD_NAME: ${{ github.event.inputs.BOARD_NAME }}
+      run: |
+        set -e
+        ./build-uefi.sh "$BOARD_NAME"
+
+    # Step 7: Locate and upload the generated ROM and checksum from ~/dev/roms
+    - name: Upload UEFI ROM and checksum
+      run: |
+        set -e
+        ROM_DIR="$HOME/dev/roms"
+        ROM_FILE=$(ls -1t ${ROM_DIR}/coreboot_edk2-${{ github.event.inputs.BOARD_NAME }}-mrchromebox_*.rom 2>/dev/null | head -n1)
+        SUM_FILE="${ROM_FILE}.sha1"
+
+        # Error handling: If ROM is not found, fail
+        if [ -z "$ROM_FILE" ] || [ ! -f "$ROM_FILE" ]; then
+          echo "Error: ROM file not found for board '${{ github.event.inputs.BOARD_NAME }}' in $ROM_DIR."
+          exit 1
+        fi
+        # Error handling: If checksum is not found, warn but continue
+        if [ ! -f "$SUM_FILE" ]; then
+          echo "Warning: SHA1 checksum not found for $ROM_FILE."
+          touch "$ROM_FILE.sha1"
+        fi
+
+        mkdir -p artifacts
+        cp "$ROM_FILE" artifacts/
+        cp "$ROM_FILE.sha1" artifacts/
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: coreboot_uefi_${{ github.event.inputs.BOARD_NAME }}_rom
+        path: artifacts/*      run: |
         sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
         sudo -E apt-get -qq update
         sudo -E apt-get -qq install \
