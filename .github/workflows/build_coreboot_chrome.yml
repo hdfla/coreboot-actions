@@ -3,7 +3,7 @@
 # Reference: https://docs.mrchromebox.tech/docs/support/compiling.html
 #
 
-name: Build UEFI coreboot ROM
+name: Build coreboot for chromebook
 
 on:
   repository_dispatch:
