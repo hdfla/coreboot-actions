@@ -6,6 +6,7 @@
 name: Build UEFI coreboot ROM
 
 on:
+  repository_dispatch:
   workflow_dispatch:
     inputs:
       BOARD_NAME:
