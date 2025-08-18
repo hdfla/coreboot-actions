@@ -1,0 +1,196 @@
+#
+# Copyright (c) 2025 hdfla <https://github.com/hdfla>
+#
+# This is free software, licensed under the MIT License.
+#
+# Workflow: Build coreboot from official repository using GitHub Actions
+#
+
+name: Build Coreboot
+
+on:
+  # Manual and API trigger support
+  repository_dispatch:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  REPO_URL: https://review.coreboot.org/coreboot.git
+  REPO_BRANCH: master
+  CONFIG_FILE: .config               # Optional: custom config file for coreboot
+  UPLOAD_BIN_DIR: false              # Set to true to upload whole build directory as artifact
+  UPLOAD_FIRMWARE: true              # Set to true to upload coreboot.rom as artifact
+  UPLOAD_RELEASE: true               # Set to true to create a GitHub Release
+  TZ: Asia/Ho_Chi_Minh               # Timezone for reproducible timestamps
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    # Step 1: Checkout workflow files
+    - name: Checkout workflow files
+      uses: actions/checkout@v4
+
+    # Step 2: System and build dependencies setup
+    - name: Setup build environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        # Remove unnecessary software to free up disk space
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo -E apt-get -qq update
+        # Install the required packages for coreboot and cross-compilation (from official docs)
+        sudo -E apt-get -qq install \
+          sudo time git-core build-essential gcc-multilib libncurses5-dev zlib1g-dev \
+          gawk flex gettext wget unzip grep rsync python3 tree python3-distutils \
+          libssl-dev bison libglib2.0-dev libpci-dev libusb-1.0-0-dev \
+          python3-pip python3-setuptools python3-wheel python3-yaml \
+          cmake doxygen help2man libflashrom-dev
+        # Clean up cache and set timezone
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+        # Prepare working directory
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+
+    # Step 3: Clone coreboot repository (recursive for submodules)
+    - name: Clone coreboot source code
+      working-directory: /workdir
+      run: |
+        set -e
+        df -hT $PWD
+        # Use shallow clone for performance but fallback to full clone on failure
+        if ! git clone --recursive --depth=1 $REPO_URL -b $REPO_BRANCH coreboot; then
+          echo "Shallow clone failed, retrying with full clone..."
+          git clone --recursive $REPO_URL -b $REPO_BRANCH coreboot
+        fi
+        ln -sf /workdir/coreboot $GITHUB_WORKSPACE/coreboot
+
+    # Step 4: Optional - Load custom configuration
+    - name: Load custom configuration (optional)
+      run: |
+        set -e
+        # If .config is provided, use it
+        if [ -e "$CONFIG_FILE" ]; then
+          mv "$CONFIG_FILE" coreboot/.config
+        fi
+
+    # Step 5: Download and build coreboot cross toolchain (as per docs)
+    - name: Build coreboot cross toolchain
+      run: |
+        set -e
+        cd coreboot
+        # Official doc: https://doc.coreboot.org/tutorial/part2.html#toolchain
+        make crossgcc-i386 || { echo "Toolchain build failed"; exit 1; }
+
+    # Step 6: Prepare configuration (menuconfig or olddefconfig)
+    - name: Prepare coreboot configuration
+      run: |
+        set -e
+        cd coreboot
+        # Use olddefconfig if custom config exists, otherwise run menuconfig (non-interactive fallback)
+        if [ -e ".config" ]; then
+          make olddefconfig
+        else
+          # For demo, create default config for QEMU x86 (per tutorial)
+          make distclean
+          make qemu-x86_defconfig
+        fi
+
+    # Step 7: Build coreboot ROM
+    - name: Compile coreboot ROM
+      id: compile
+      run: |
+        set -e
+        cd coreboot
+        echo -e "$(nproc) thread compile"
+        # Try parallel build, fallback to single thread and verbose if fails
+        if ! make -j$(nproc); then
+          echo "Parallel build failed, retrying with single thread and verbose output..."
+          make -j1 V=1
+        fi
+        # Check if output ROM exists
+        if [ ! -f build/coreboot.rom ]; then
+          echo "coreboot.rom not found, build likely failed."
+          exit 2
+        fi
+        echo "status=success" >> $GITHUB_OUTPUT
+        echo "DEVICE_NAME=_coreboot" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+    # Step 8: Check disk usage before uploading
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
+
+    # Step 9: Upload full build directory (optional)
+    - name: Upload build directory
+      uses: actions/upload-artifact@v4
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+      with:
+        name: coreboot_build${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: coreboot/build
+
+    # Step 10: Organize output firmware files for artifact/release
+    - name: Organize firmware files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        set -e
+        cd coreboot/build
+        # Edge case: If the firmware file doesn't exist, fail gracefully
+        if [ ! -f coreboot.rom ]; then
+          echo "coreboot.rom not found, cannot proceed with upload."
+          exit 3
+        fi
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    # Step 11: Upload coreboot.rom as artifact
+    - name: Upload firmware ROM
+      uses: actions/upload-artifact@v4
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: coreboot_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}/coreboot.rom
+
+    # Step 12: Generate release tag and body
+    - name: Generate release tag and body
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && steps.compile.outputs.status == 'success' && !cancelled()
+      run: |
+        set -e
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+        touch release.txt
+        echo "## Coreboot Release $(date +"%Y.%m.%d-%H:%M")" >> release.txt
+        echo "- coreboot.rom" >> release.txt
+        echo "  -md5: $(md5sum ${{ env.FIRMWARE }}/coreboot.rom | cut -d' ' -f1)" >> release.txt
+        echo "  -sha256: $(sha256sum ${{ env.FIRMWARE }}/coreboot.rom | cut -d' ' -f1)" >> release.txt
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    # Step 13: Upload to GitHub release
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@v1
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: release.txt
+        files: |
+          ${{ env.FIRMWARE }}/coreboot.rom
+          coreboot/.config
+
+    # Step 14: Remove old Releases to save space (best practice)
+    - name: Remove old Releases
+      uses: dev-drprasad/delete-older-releases@v0.2.1
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      with:
+        keep_latest: 5
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
