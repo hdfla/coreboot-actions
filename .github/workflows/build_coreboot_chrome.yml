@@ -1,0 +1,102 @@
+#
+# Workflow: Build UEFI coreboot ROM for specified Chromebook board using MrChromebox's build-uefi.sh
+# Reference: https://docs.mrchromebox.tech/docs/support/compiling.html
+#
+
+name: Build UEFI coreboot ROM
+
+on:
+  workflow_dispatch:
+    inputs:
+      BOARD_NAME:
+        description: 'Chromebook board name (e.g. samus, glk, panther, etc)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  REPO_URL: https://github.com/MrChromebox/coreboot.git
+  REPO_BRANCH: MrChromebox-2503
+  TZ: Asia/Ho_Chi_Minh
+
+jobs:
+  build-uefi:
+    runs-on: ubuntu-22.04
+
+    steps:
+    # Step 1: Checkout workflow files (such as custom logos, configs, etc)
+    - name: Checkout workflow files
+      uses: actions/checkout@v4
+
+    # Step 2: Install build dependencies as per MrChromebox's documentation
+    - name: Install build dependencies
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install \
+          git build-essential gnat flex bison libncurses5-dev libncursesw5-dev \
+          zlib1g-dev libusb-1.0-0-dev libpci-dev libftdi-dev libssl-dev \
+          libelf-dev python3 python3-distutils python3-pip \
+          cmake doxygen help2man
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+
+    # Step 3: Clone MrChromebox's coreboot repository (full clone for reliability)
+    - name: Clone coreboot source code
+      run: |
+        set -e
+        git clone --recursive $REPO_URL -b $REPO_BRANCH coreboot
+
+    # Step 4: Build only the i386 toolchain (performance optimization)
+    - name: Build i386 toolchain for coreboot
+      run: |
+        set -e
+        cd coreboot
+        make crossgcc-i386 || { echo "Toolchain build failed"; exit 1; }
+
+    # Step 5: Execute build-uefi.sh for specified board
+    - name: Build UEFI ROM for board ${{ github.event.inputs.BOARD_NAME }}
+      working-directory: coreboot
+      env:
+        BOARD_NAME: ${{ github.event.inputs.BOARD_NAME }}
+      run: |
+        set -e
+        # Run the build script with the board name argument
+        ./build-uefi.sh "$BOARD_NAME"
+
+    # Step 6: Locate and upload the generated ROM and checksum from ~/dev/roms
+    - name: Upload UEFI ROM and checksum
+      run: |
+        set -e
+        # The output is always placed in ~/dev/roms by build-uefi.sh
+        ROM_DIR="$HOME/dev/roms"
+        # Find ROM and checksum for the board, most recent by date (edge-case: multiple builds)
+        ROM_FILE=$(ls -1t ${ROM_DIR}/coreboot_edk2-${{ github.event.inputs.BOARD_NAME }}-mrchromebox_*.rom 2>/dev/null | head -n1)
+        SUM_FILE="${ROM_FILE}.sha1"
+
+        # Error handling: If ROM is not found, fail
+        if [ -z "$ROM_FILE" ] || [ ! -f "$ROM_FILE" ]; then
+          echo "Error: ROM file not found for board '${{ github.event.inputs.BOARD_NAME }}' in $ROM_DIR."
+          exit 1
+        fi
+        # Error handling: If checksum is not found, warn but continue
+        if [ ! -f "$SUM_FILE" ]; then
+          echo "Warning: SHA1 checksum not found for $ROM_FILE."
+          touch "$ROM_FILE.sha1"
+        fi
+
+        # Copy to workspace for artifact upload
+        mkdir -p artifacts
+        cp "$ROM_FILE" artifacts/
+        cp "$ROM_FILE.sha1" artifacts/
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: coreboot_uefi_${{ github.event.inputs.BOARD_NAME }}_rom
+        path: artifacts/*
