@@ -97,7 +97,7 @@ jobs:
     - name: Upload UEFI ROM and checksum
       run: |
         set -e
-        ROM_DIR="$HOME/roms"
+        ROM_DIR="/home/runner/work/coreboot-actions/coreboot-actions/roms"
         ROM_FILE=$(ls -1t ${ROM_DIR}/coreboot_edk2-${{ github.event.inputs.BOARD_NAME }}-mrchromebox_*.rom 2>/dev/null | head -n1)
         SUM_FILE="${ROM_FILE}.sha1"
 
