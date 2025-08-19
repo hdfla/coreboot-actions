@@ -28,7 +28,7 @@ env:
 
 jobs:
   build-uefi:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
 
     steps:
     # Step 1: Checkout workflow files (such as custom logos, configs, etc)
